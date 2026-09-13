@@ -111,6 +111,125 @@ def change_password(
     return {"ok": True}
 
 
+# ------------------------------------------------------------------ mot de passe oublié (OTP)
+OTP_TTL_MINUTES = 10
+OTP_MAX_ATTEMPTS = 5
+OTP_RESEND_SECONDS = 60
+
+
+def _hash_otp(code: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(code.encode()).hexdigest()
+
+
+def _latest_valid_reset(db: Session, user_id: int):
+    from datetime import datetime
+
+    return (
+        db.query(models.PasswordReset)
+        .filter(
+            models.PasswordReset.user_id == user_id,
+            models.PasswordReset.used == False,  # noqa: E712
+            models.PasswordReset.expires_at > datetime.utcnow(),
+        )
+        .order_by(models.PasswordReset.created_at.desc())
+        .first()
+    )
+
+
+@router.post("/forgot-password")
+def forgot_password(payload: schemas.ForgotPasswordRequest, db: Session = Depends(get_db)):
+    """Demande un code OTP. Réponse générique anti-énumération (même si l'email n'existe pas)."""
+    import secrets
+    from datetime import datetime, timedelta
+
+    from ..services.otp import dev_echo_enabled, send_otp_email
+
+    email = payload.email.lower().strip()
+    user = db.query(models.User).filter(models.User.email == email).first()
+    demo_code = None
+    if user is not None:
+        # Anti-spam : refuse un nouveau code si le précédent a moins de 60 s
+        latest = (
+            db.query(models.PasswordReset)
+            .filter(models.PasswordReset.user_id == user.id)
+            .order_by(models.PasswordReset.created_at.desc())
+            .first()
+        )
+        if latest is not None and latest.created_at is not None:
+            elapsed = (datetime.utcnow() - latest.created_at).total_seconds()
+            if elapsed < OTP_RESEND_SECONDS:
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Un code vient d'être envoyé. Réessayez dans {int(OTP_RESEND_SECONDS - elapsed)} s.",
+                )
+        # Invalide les anciens codes encore actifs
+        db.query(models.PasswordReset).filter(
+            models.PasswordReset.user_id == user.id,
+            models.PasswordReset.used == False,  # noqa: E712
+        ).update({"used": True})
+        code = f"{secrets.randbelow(1_000_000):06d}"
+        reset = models.PasswordReset(
+            user_id=user.id,
+            code_hash=_hash_otp(code),
+            expires_at=datetime.utcnow() + timedelta(minutes=OTP_TTL_MINUTES),
+            attempts=0,
+            used=False,
+        )
+        db.add(reset)
+        db.commit()
+        sent = send_otp_email(email, code)
+        if not sent and dev_echo_enabled():
+            demo_code = code  # mode démo : affiché côté frontend pour tester sans SMTP
+    response = {"ok": True, "message": "Si ce compte existe, un code à 6 chiffres a été envoyé."}
+    if demo_code:
+        response["demo_code"] = demo_code
+    return response
+
+
+@router.post("/verify-otp")
+def verify_otp(payload: schemas.VerifyOtpRequest, db: Session = Depends(get_db)):
+    """Vérifie le code sans le consommer (l'étape reset le consomme)."""
+    email = payload.email.lower().strip()
+    user = db.query(models.User).filter(models.User.email == email).first()
+    if user is None:
+        raise HTTPException(status_code=400, detail="Code invalide ou expiré.")
+    reset = _latest_valid_reset(db, user.id)
+    if reset is None:
+        raise HTTPException(status_code=400, detail="Code invalide ou expiré.")
+    if reset.attempts >= OTP_MAX_ATTEMPTS:
+        raise HTTPException(status_code=429, detail="Trop de tentatives. Demandez un nouveau code.")
+    reset.attempts += 1
+    if reset.code_hash != _hash_otp(payload.code):
+        db.commit()
+        raise HTTPException(status_code=400, detail="Code invalide ou expiré.")
+    db.commit()
+    return {"ok": True, "message": "Code vérifié. Choisissez un nouveau mot de passe."}
+
+
+@router.post("/reset-password")
+def reset_password(payload: schemas.ResetPasswordRequest, db: Session = Depends(get_db)):
+    """Réinitialise le mot de passe et consomme le code (usage unique)."""
+    email = payload.email.lower().strip()
+    user = db.query(models.User).filter(models.User.email == email).first()
+    if user is None:
+        raise HTTPException(status_code=400, detail="Code invalide ou expiré.")
+    reset = _latest_valid_reset(db, user.id)
+    if reset is None:
+        raise HTTPException(status_code=400, detail="Code invalide ou expiré.")
+    if reset.attempts >= OTP_MAX_ATTEMPTS:
+        raise HTTPException(status_code=429, detail="Trop de tentatives. Demandez un nouveau code.")
+    reset.attempts += 1
+    if reset.code_hash != _hash_otp(payload.code):
+        db.commit()
+        raise HTTPException(status_code=400, detail="Code invalide ou expiré.")
+    reset.used = True
+    user.hashed_password = auth.hash_password(payload.new_password)
+    db.commit()
+    return {"ok": True, "message": "Mot de passe réinitialisé. Connectez-vous."}
+
+
 @router.get("/users", response_model=list[schemas.UserOut])
 def list_users(
     response: Response,

@@ -14,6 +14,7 @@ import Checkout from "./pages/Checkout";
 import OrderConfirmation from "./pages/OrderConfirmation";
 import Invoice from "./pages/Invoice";
 import Login from "./pages/Login";
+import ForgotPassword from "./pages/ForgotPassword";
 import Register from "./pages/Register";
 import Orders from "./pages/Orders";
 import Profile from "./pages/Profile";
@@ -59,6 +60,7 @@ export default function App() {
                 <Route path="/product/:id" element={<ProductDetail />} />
                 <Route path="/cart" element={<Cart />} />
                 <Route path="/login" element={<Login />} />
+                <Route path="/forgot-password" element={<ForgotPassword />} />
                 <Route path="/register" element={<Register />} />
                 <Route path="/checkout" element={guard(<Checkout />)} />
                 <Route path="/orders" element={guard(<Orders />)} />

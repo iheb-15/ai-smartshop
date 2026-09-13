@@ -49,15 +49,15 @@ export default function Login() {
           Se connecter
         </button>
       </form>
+      <p className="text-center text-sm mt-4">
+        <Link to="/forgot-password" className="text-brand-600 font-semibold hover:underline">
+          Mot de passe oublié ?
+        </Link>
+      </p>
       <p className="text-center text-sm text-ink/50 mt-5">
         Pas de compte ? <Link to="/register" className="text-brand-600 font-semibold">S'inscrire</Link>
       </p>
-      <p className="text-center text-xs text-ink/30 mt-3">
-        Démo admin : admin@shop.com / admin123
-      </p>
-      <p className="text-center text-xs text-ink/30">
-        Démo client : client@shop.com / client123
-      </p>
+      
     </div>
   );
 }
