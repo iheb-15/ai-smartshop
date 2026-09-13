@@ -1,29 +1,36 @@
 import { useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { Link, NavLink, useNavigate } from "react-router-dom";
 import { useAuth } from "../context/AuthContext";
 import { useCart } from "../context/CartContext";
+import { useWishlist } from "../context/WishlistContext";
 
 export default function Navbar() {
   const { user, logout } = useAuth();
-  const { items } = useCart();
+  const { count: cartCount } = useCart();
+  const wishlist = useWishlist();
   const navigate = useNavigate();
   const [menuOpen, setMenuOpen] = useState(false);
-  const cartCount = items.reduce((n, it) => n + it.quantity, 0);
 
   const closeAnd = (fn) => () => {
     setMenuOpen(false);
     if (fn) fn();
   };
+  const linkClass = ({ isActive }) => `hover:text-brand-600 ${isActive ? "text-brand-700 font-semibold" : ""}`;
 
   return (
-    <header className="sticky top-0 z-40 bg-white/90 backdrop-blur border-b border-brand-100">
+    <header className="sticky top-0 z-40 bg-white/90 backdrop-blur border-b border-brand-100 print:hidden">
       <div className="max-w-6xl mx-auto px-5 py-4 flex items-center justify-between">
         <Link to="/" className="font-display text-2xl text-brand-700 tracking-tight">
           Néo<span className="text-brand-500">Shop</span>
         </Link>
-        <nav className="hidden md:flex items-center gap-8 text-sm font-medium text-ink/70">
-          <Link to="/shop" className="hover:text-brand-600">Boutique</Link>
-          {user && <Link to="/orders" className="hover:text-brand-600">Mes commandes</Link>}
+        <nav className="hidden md:flex items-center gap-7 text-sm font-medium text-ink/70">
+          <NavLink to="/shop" className={linkClass}>Boutique</NavLink>
+          {user && <NavLink to="/orders" className={linkClass}>Mes commandes</NavLink>}
+          {user && (
+            <NavLink to="/wishlist" className={linkClass}>
+              Favoris{wishlist?.count > 0 && <span className="ml-1 text-xs text-rose-500 font-bold">{wishlist.count}</span>}
+            </NavLink>
+          )}
           {user?.is_admin && (
             <Link
               to="/admin/dashboard"
@@ -34,10 +41,7 @@ export default function Navbar() {
           )}
         </nav>
         <div className="flex items-center gap-4">
-          <Link
-            to="/cart"
-            className="relative text-sm font-semibold text-ink/80 hover:text-brand-600"
-          >
+          <Link to="/cart" className="relative text-sm font-semibold text-ink/80 hover:text-brand-600">
             Panier
             {cartCount > 0 && (
               <span className="absolute -top-2 -right-3 bg-brand-500 text-white text-xs w-5 h-5 rounded-full flex items-center justify-center">
@@ -46,9 +50,9 @@ export default function Navbar() {
             )}
           </Link>
           {user ? (
-            <span className="hidden sm:inline text-sm text-ink/60">
+            <Link to="/profile" className="hidden sm:inline text-sm text-ink/60 hover:text-brand-700">
               Bonjour, <strong className="text-ink">{user.full_name?.split(" ")[0]}</strong>
-            </span>
+            </Link>
           ) : null}
           {user ? (
             <button
@@ -68,7 +72,6 @@ export default function Navbar() {
               Connexion
             </Link>
           )}
-          {/* Bouton menu mobile */}
           <button
             onClick={() => setMenuOpen((o) => !o)}
             className="md:hidden p-2 rounded-lg border border-brand-100 text-ink/70"
@@ -78,11 +81,12 @@ export default function Navbar() {
           </button>
         </div>
       </div>
-      {/* Menu mobile déroulant */}
       {menuOpen && (
         <nav className="md:hidden border-t border-brand-100 bg-white px-5 py-4 flex flex-col gap-3 text-sm font-medium text-ink/80">
           <Link to="/shop" onClick={closeAnd()} className="py-1">Boutique</Link>
           {user && <Link to="/orders" onClick={closeAnd()} className="py-1">Mes commandes</Link>}
+          {user && <Link to="/wishlist" onClick={closeAnd()} className="py-1">Favoris</Link>}
+          {user && <Link to="/profile" onClick={closeAnd()} className="py-1">Mon profil</Link>}
           {user?.is_admin && (
             <Link
               to="/admin/dashboard"
@@ -103,11 +107,7 @@ export default function Navbar() {
               Déconnexion ({user.email})
             </button>
           ) : (
-            <Link
-              to="/login"
-              onClick={closeAnd()}
-              className="bg-brand-600 text-white text-sm font-semibold px-4 py-2 rounded-full text-center"
-            >
+            <Link to="/login" onClick={closeAnd()} className="bg-brand-600 text-white text-sm font-semibold px-4 py-2 rounded-full text-center">
               Connexion
             </Link>
           )}

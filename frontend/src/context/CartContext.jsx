@@ -13,12 +13,23 @@ export function CartProvider({ children }) {
       setItems([]);
       return;
     }
-    const res = await api.get("/cart/");
-    setItems(res.data);
+    try {
+      const res = await api.get("/cart/");
+      setItems(res.data);
+    } catch {
+      setItems([]);
+    }
   }, [user]);
 
   useEffect(() => {
     refresh();
+  }, [refresh]);
+
+  // Le chatbot peut modifier le panier : il émet cet événement pour resynchroniser l'UI
+  useEffect(() => {
+    const onCartUpdated = () => refresh();
+    window.addEventListener("cart:updated", onCartUpdated);
+    return () => window.removeEventListener("cart:updated", onCartUpdated);
   }, [refresh]);
 
   const addToCart = async (productId, quantity = 1) => {
@@ -27,7 +38,7 @@ export function CartProvider({ children }) {
   };
 
   const updateQuantity = async (itemId, quantity) => {
-    await api.put(`/cart/${itemId}`, null, { params: { quantity } });
+    await api.put(`/cart/${itemId}`, { quantity });
     await refresh();
   };
 
@@ -36,24 +47,20 @@ export function CartProvider({ children }) {
     await refresh();
   };
 
-  const total = items.reduce(
-    (sum, it) => {
-      const p = it.product || {};
-      const unit = p.effective_price != null ? p.effective_price : p.promo_price != null ? p.promo_price : p.price;
-      return sum + unit * it.quantity;
-    },
-    0
-  );
-
   const clearCart = async () => {
     await api.delete("/cart/clear");
     await refresh();
   };
 
+  const total = items.reduce((sum, it) => {
+    const p = it.product || {};
+    const unit = p.effective_price != null ? p.effective_price : p.promo_price != null ? p.promo_price : p.price;
+    return sum + unit * it.quantity;
+  }, 0);
+  const count = items.reduce((n, it) => n + it.quantity, 0);
+
   return (
-    <CartContext.Provider
-      value={{ items, addToCart, updateQuantity, removeItem, clearCart, refresh, total }}
-    >
+    <CartContext.Provider value={{ items, addToCart, updateQuantity, removeItem, clearCart, refresh, total, count }}>
       {children}
     </CartContext.Provider>
   );

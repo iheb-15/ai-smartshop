@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 from typing import Optional
 
@@ -8,17 +9,34 @@ from ..database import get_db
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
+def _user_out(u: models.User) -> schemas.UserOut:
+    return schemas.UserOut(
+        id=u.id,
+        full_name=u.full_name,
+        email=u.email,
+        is_admin=u.is_admin,
+        is_active=u.is_active,
+        phone=u.phone,
+        address=u.address,
+        city=u.city,
+        postal_code=u.postal_code,
+        created_at=u.created_at,
+        orders_count=len(u.orders),
+    )
+
+
 @router.post("/register", response_model=schemas.Token)
 def register(payload: schemas.UserCreate, db: Session = Depends(get_db)):
-    existing = db.query(models.User).filter(models.User.email == payload.email).first()
+    email = payload.email.lower().strip()
+    existing = db.query(models.User).filter(models.User.email == email).first()
     if existing:
-        raise HTTPException(status_code=400, detail="Email already registered")
+        raise HTTPException(status_code=400, detail="Cet email est déjà utilisé.")
 
     # Sécurité : inscription publique toujours en compte client.
     # La promotion admin se fait uniquement via le panel admin (PATCH /auth/users/{id}).
     user = models.User(
-        full_name=payload.full_name,
-        email=payload.email,
+        full_name=payload.full_name.strip(),
+        email=email,
         hashed_password=auth.hash_password(payload.password),
         is_admin=False,
     )
@@ -27,27 +45,70 @@ def register(payload: schemas.UserCreate, db: Session = Depends(get_db)):
     db.refresh(user)
 
     token = auth.create_access_token({"sub": str(user.id)})
-    return schemas.Token(access_token=token, user=user)
+    return schemas.Token(access_token=token, user=_user_out(user))
 
 
-@router.post("/login", response_model=schemas.Token)
-def login(payload: schemas.UserLogin, db: Session = Depends(get_db)):
-    user = db.query(models.User).filter(models.User.email == payload.email).first()
-    if not user or not auth.verify_password(payload.password, user.hashed_password):
-        raise HTTPException(status_code=401, detail="Invalid email or password")
+def _authenticate(db: Session, email: str, password: str) -> models.User:
+    user = db.query(models.User).filter(models.User.email == email.lower().strip()).first()
+    if not user or not auth.verify_password(password, user.hashed_password):
+        raise HTTPException(status_code=401, detail="Email ou mot de passe incorrect.")
     if not user.is_active:
         raise HTTPException(
             status_code=403,
             detail="Ce compte a été désactivé. Veuillez contacter un administrateur.",
         )
+    return user
 
+
+@router.post("/login", response_model=schemas.Token)
+def login(payload: schemas.UserLogin, db: Session = Depends(get_db)):
+    user = _authenticate(db, payload.email, payload.password)
     token = auth.create_access_token({"sub": str(user.id)})
-    return schemas.Token(access_token=token, user=user)
+    return schemas.Token(access_token=token, user=_user_out(user))
+
+
+@router.post("/token", response_model=schemas.Token, include_in_schema=True)
+def login_form(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    """Variante OAuth2 (formulaire) utilisée par le bouton « Authorize » de Swagger UI."""
+    user = _authenticate(db, form.username, form.password)
+    token = auth.create_access_token({"sub": str(user.id)})
+    return schemas.Token(access_token=token, user=_user_out(user))
 
 
 @router.get("/me", response_model=schemas.UserOut)
 def me(current_user: models.User = Depends(auth.get_current_user)):
-    return current_user
+    return _user_out(current_user)
+
+
+@router.put("/me", response_model=schemas.UserOut)
+def update_me(
+    payload: schemas.UserProfileUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+):
+    """Mise à jour du profil (nom, téléphone, adresse de livraison par défaut)."""
+    for key, value in payload.model_dump(exclude_unset=True).items():
+        if value is not None:
+            value = value.strip()
+        setattr(current_user, key, value)
+    db.commit()
+    db.refresh(current_user)
+    return _user_out(current_user)
+
+
+@router.put("/me/password")
+def change_password(
+    payload: schemas.PasswordChange,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+):
+    if not auth.verify_password(payload.current_password, current_user.hashed_password):
+        raise HTTPException(status_code=400, detail="Mot de passe actuel incorrect.")
+    if payload.current_password == payload.new_password:
+        raise HTTPException(status_code=400, detail="Le nouveau mot de passe doit être différent de l'actuel.")
+    current_user.hashed_password = auth.hash_password(payload.new_password)
+    db.commit()
+    return {"ok": True}
 
 
 @router.get("/users", response_model=list[schemas.UserOut])
@@ -76,18 +137,7 @@ def list_users(
     total = query.count()
     users = query.order_by(models.User.created_at.desc()).offset(skip).limit(limit).all()
     response.headers["X-Total-Count"] = str(total)
-    return [
-        schemas.UserOut(
-            id=u.id,
-            full_name=u.full_name,
-            email=u.email,
-            is_admin=u.is_admin,
-            is_active=u.is_active,
-            created_at=u.created_at,
-            orders_count=len(u.orders),
-        )
-        for u in users
-    ]
+    return [_user_out(u) for u in users]
 
 
 @router.get("/users/{user_id}", response_model=schemas.UserDetailOut)
@@ -97,6 +147,8 @@ def user_detail(
     admin: models.User = Depends(auth.get_current_admin),
 ):
     """Fiche client : profil + commandes + total depense + avis."""
+    from .orders import _enrich_order_items
+
     u = db.query(models.User).filter(models.User.id == user_id).first()
     if not u:
         raise HTTPException(status_code=404, detail="Utilisateur non trouvé.")
@@ -107,6 +159,8 @@ def user_detail(
         .limit(20)
         .all()
     )
+    for o in orders:
+        _enrich_order_items(db, o)
     total_spent = round(
         sum((o.total or 0.0) for o in u.orders if (o.status or "").upper() != "CANCELLED"),
         2,
@@ -119,6 +173,10 @@ def user_detail(
         email=u.email,
         is_admin=u.is_admin,
         is_active=u.is_active,
+        phone=u.phone,
+        address=u.address,
+        city=u.city,
+        postal_code=u.postal_code,
         created_at=u.created_at,
         orders_count=len(u.orders),
         total_spent=total_spent,
@@ -148,16 +206,7 @@ def update_user(
         user.is_active = payload.is_active
     db.commit()
     db.refresh(user)
-    return schemas.UserOut(
-        id=user.id,
-        full_name=user.full_name,
-        email=user.email,
-        is_admin=user.is_admin,
-        is_active=user.is_active,
-        created_at=user.created_at,
-        orders_count=len(user.orders),
-    )
-
+    return _user_out(user)
 
 
 @router.delete("/users/{user_id}")
@@ -177,7 +226,11 @@ def delete_user(
             detail="Impossible de supprimer un utilisateur ayant des commandes. Vous pouvez désactiver son compte."
         )
     db.query(models.CartItem).filter(models.CartItem.user_id == user_id).delete()
+    db.query(models.WishlistItem).filter(models.WishlistItem.user_id == user_id).delete()
+    db.query(models.Review).filter(models.Review.user_id == user_id).delete()
+    db.query(models.Interaction).filter(models.Interaction.user_id == user_id).delete()
     db.query(models.ChatMessage).filter(models.ChatMessage.user_id == user_id).delete()
+    db.query(models.Payment).filter(models.Payment.user_id == user_id, models.Payment.order_id == None).delete()  # noqa: E711
     db.delete(user)
     db.commit()
     return {"ok": True}

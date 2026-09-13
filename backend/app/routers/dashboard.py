@@ -278,7 +278,59 @@ def stats(
         .all()
     )
 
+    # Chiffre d'affaires par catégorie (période, hors annulées)
+    cat_rev_q = (
+        db.query(models.Category.name, func.coalesce(func.sum(models.OrderItem.quantity * models.OrderItem.unit_price), 0.0))
+        .join(models.Product, models.Product.category_id == models.Category.id)
+        .join(models.OrderItem, models.OrderItem.product_id == models.Product.id)
+        .join(models.Order, models.Order.id == models.OrderItem.order_id)
+        .filter(models.Order.status != "CANCELLED")
+    )
+    if start:
+        cat_rev_q = cat_rev_q.filter(models.Order.created_at >= start)
+    category_revenue = [{"name": n, "revenue": round(float(r or 0.0), 2)} for n, r in cat_rev_q.group_by(models.Category.id).all()]
+
+    # Paiements (simulation) : répartition par méthode, impayés, échecs
+    pay_q = base_orders.with_entities(models.Order.payment_method, func.count(models.Order.id), func.coalesce(func.sum(models.Order.total), 0.0)).group_by(models.Order.payment_method).all()
+    payment_methods = [{"method": m or "card", "orders": int(c), "revenue": round(float(r or 0.0), 2)} for m, c, r in pay_q]
+    unpaid_q = base_orders.filter(models.Order.payment_status == "UNPAID")
+    failed_q = db.query(models.Payment).filter(models.Payment.status == "FAILED")
+    if start:
+        failed_q = failed_q.filter(models.Payment.created_at >= start)
+    refunded_q = db.query(models.Payment).filter(models.Payment.status == "REFUNDED")
+    if start:
+        refunded_q = refunded_q.filter(models.Payment.created_at >= start)
+    payments = {
+        "methods": payment_methods,
+        "unpaid_orders": unpaid_q.count(),
+        "unpaid_amount": round(float(unpaid_q.with_entities(func.sum(models.Order.total)).scalar() or 0.0), 2),
+        "failed_attempts": failed_q.count(),
+        "refunded_amount": round(abs(float(refunded_q.with_entities(func.sum(models.Payment.amount)).scalar() or 0.0)), 2),
+    }
+
+    # Comportement : événements de la période + taux de conversion vue -> achat
+    ev_q = db.query(models.Interaction.event_type, func.count(models.Interaction.id))
+    if start:
+        ev_q = ev_q.filter(models.Interaction.created_at >= start)
+    events_by_type = {t: int(c) for t, c in ev_q.group_by(models.Interaction.event_type).all()}
+    views = events_by_type.get("view", 0)
+    behavior = {
+        "views": views,
+        "cart_adds": events_by_type.get("add_to_cart", 0),
+        "searches": events_by_type.get("search", 0),
+        "chats": events_by_type.get("chat", 0),
+        "conversion_rate": round(total_orders / views * 100, 1) if views else None,
+    }
+    new_customers_q = db.query(func.count(models.User.id)).filter(models.User.is_admin == False)  # noqa: E712
+    if start:
+        new_customers_q = new_customers_q.filter(models.User.created_at >= start)
+
     return {
+        "payments": payments,
+        "behavior": behavior,
+        "category_revenue": category_revenue,
+        "new_customers": int(new_customers_q.scalar() or 0),
+        "wishlist_items": db.query(func.count(models.WishlistItem.id)).scalar() or 0,
         "period": period,
         "server_today": server_today,
         "total_revenue": round(total_revenue, 2),
@@ -319,7 +371,7 @@ def export_orders_csv(
     orders = query.all()
     buf = io.StringIO()
     writer = csv.writer(buf, delimiter=";")
-    writer.writerow(["id", "date", "client", "email", "statut", "articles", "total_DT"])
+    writer.writerow(["id", "date", "client", "email", "statut", "paiement", "statut_paiement", "ville", "articles", "total_DT"])
     for o in orders:
         writer.writerow(
             [
@@ -328,6 +380,9 @@ def export_orders_csv(
                 o.user.full_name if o.user else "Client",
                 o.user.email if o.user else "",
                 (o.status or "").upper(),
+                o.payment_method or "",
+                o.payment_status or "",
+                o.shipping_city or "",
                 sum((i.quantity or 0) for i in o.items),
                 round(o.total or 0.0, 2),
             ]

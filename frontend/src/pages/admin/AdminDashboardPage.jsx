@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import api from "../../api/client";
 import { useAuth } from "../../context/AuthContext";
+import { RevenueAreaChart, DonutChart, SimpleBarChart } from "../../components/admin/Charts";
 
 export default function AdminDashboardPage() {
   const { user } = useAuth();
@@ -97,7 +98,10 @@ export default function AdminDashboardPage() {
   }
 
   const timeline = stats?.sales_timeline || [];
-  const maxRevenue = Math.max(...timeline.map((t) => t.revenue), 10);
+  const payments = stats?.payments || { methods: [], unpaid_orders: 0, unpaid_amount: 0, failed_attempts: 0, refunded_amount: 0 };
+  const behavior = stats?.behavior || {};
+  const statusData = (stats?.orders_by_status || []).map((s) => ({ name: s.status, value: s.count }));
+  const methodData = payments.methods.map((m) => ({ name: m.method === "card" ? "Carte bancaire" : "À la livraison", value: m.orders, revenue: m.revenue }));
 
   return (
     <div className="space-y-8">
@@ -255,42 +259,9 @@ export default function AdminDashboardPage() {
           </div>
 
           {timeline.length > 0 ? (
-            <div className="w-full pt-4">
-              <div className="h-44 w-full flex items-stretch justify-between gap-2 border-b border-slate-100 pb-2">
-                {timeline.map((item, idx) => {
-                  const heightPercent = item.revenue > 0 ? Math.max(8, Math.round((item.revenue / maxRevenue) * 100)) : 0;
-                  const isToday = item.full_date === stats?.server_today;
-                  return (
-                    <div key={item.full_date || idx} className="flex-1 h-full flex flex-col items-center justify-end group relative min-w-0">
-                      {/* Tooltip */}
-                      <div className="absolute -top-12 bg-ink text-white text-[11px] py-1 px-2 rounded shadow-md opacity-0 group-hover:opacity-100 transition pointer-events-none whitespace-nowrap z-10">
-                        {item.full_date?.split("-").reverse().join("/")} : {item.revenue.toFixed(2)} DT ({item.orders} cmd)
-                      </div>
-                      {/* Bar */}
-                      {item.revenue > 0 ? (
-                        <div
-                          style={{ height: `${heightPercent}%` }}
-                          className={`w-full max-w-[36px] min-h-[8px] rounded-t-lg transition ${
-                            isToday
-                              ? "bg-gradient-to-t from-emerald-600 to-emerald-400 ring-2 ring-emerald-300"
-                              : "bg-gradient-to-t from-brand-600 to-brand-400 group-hover:from-brand-500 group-hover:to-emerald-400"
-                          }`}
-                        />
-                      ) : (
-                        <div className="w-full max-w-[36px] flex flex-col items-center justify-end" style={{ height: "8%" }}>
-                          <div className={`w-full h-[3px] rounded-full ${isToday ? "bg-emerald-300" : "bg-slate-200"}`} />
-                        </div>
-                      )}
-                      <span className={`text-[10px] mt-2 truncate max-w-full font-semibold ${isToday ? "text-emerald-600" : "text-slate-400"}`}>
-                        {item.date}{isToday ? " •" : ""}
-                      </span>
-                    </div>
-                  );
-                })}
-              </div>
-              <p className="text-[11px] text-slate-400 mt-2">
-                Jours sans vente affichés à 0 (—) — barre verte = aujourd'hui. Survolez une barre pour la date complète + CA.
-              </p>
+            <div className="w-full pt-2">
+              <RevenueAreaChart data={timeline} />
+              <p className="text-[11px] text-slate-400 mt-2">Aire verte : chiffre d'affaires (DT) — ligne violette : nombre de commandes. Jours sans vente affichés à 0.</p>
             </div>
           ) : (
             <div className="h-48 flex flex-col items-center justify-center text-slate-400 text-sm">
@@ -311,20 +282,11 @@ export default function AdminDashboardPage() {
             </div>
             <p className="text-xs text-slate-400 mb-5">Répartition actuelle du cycle de traitement</p>
 
-            <div className="space-y-3">
-              {(stats?.orders_by_status || []).length > 0 ? (
-                stats.orders_by_status.map((item, idx) => (
-                  <div key={idx} className="flex items-center justify-between text-sm">
-                    <span className={`px-2.5 py-0.5 rounded-full text-xs font-semibold border ${getStatusBadge(item.status)}`}>
-                      {item.status}
-                    </span>
-                    <span className="font-semibold text-ink">{item.count}</span>
-                  </div>
-                ))
-              ) : (
-                <p className="text-xs text-slate-400 py-4 text-center">Aucune commande enregistrée.</p>
-              )}
-            </div>
+            {statusData.length > 0 ? (
+              <DonutChart data={statusData} height={190} />
+            ) : (
+              <p className="text-xs text-slate-400 py-4 text-center">Aucune commande enregistrée.</p>
+            )}
           </div>
 
           {/* Customer Reviews AI Sentiment mini-widget */}
@@ -350,6 +312,71 @@ export default function AdminDashboardPage() {
               ))}
             </div>
           </div>
+        </div>
+      </div>
+
+      {/* Paiements, comportement & CA par catégorie */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <div className="bg-white border border-slate-200/80 rounded-2xl p-6 shadow-xs">
+          <div className="flex items-center justify-between mb-1">
+            <h2 className="font-display text-lg font-bold text-ink">Paiements (simulation)</h2>
+            <Link to="/admin/orders" className="text-xs font-semibold text-brand-600 hover:underline">Commandes →</Link>
+          </div>
+          <p className="text-xs text-slate-400 mb-4">Répartition par mode de paiement, impayés et échecs</p>
+          {methodData.length > 0 ? <DonutChart data={methodData} height={160} colors={["#1f7a5c", "#f59e0b"]} /> : <p className="text-xs text-slate-400 py-4 text-center">Aucun paiement.</p>}
+          <div className="grid grid-cols-3 gap-2 mt-4 text-center">
+            <div className="bg-amber-50 border border-amber-100 rounded-xl p-2">
+              <p className="font-display text-lg font-bold text-amber-700">{payments.unpaid_orders}</p>
+              <p className="text-[10px] text-amber-700">à encaisser<br />({payments.unpaid_amount.toFixed(0)} DT)</p>
+            </div>
+            <div className="bg-rose-50 border border-rose-100 rounded-xl p-2">
+              <p className="font-display text-lg font-bold text-rose-700">{payments.failed_attempts}</p>
+              <p className="text-[10px] text-rose-700">paiements<br />refusés</p>
+            </div>
+            <div className="bg-slate-50 border border-slate-200 rounded-xl p-2">
+              <p className="font-display text-lg font-bold text-slate-700">{payments.refunded_amount.toFixed(0)}</p>
+              <p className="text-[10px] text-slate-600">DT<br />remboursés</p>
+            </div>
+          </div>
+        </div>
+
+        <div className="bg-white border border-slate-200/80 rounded-2xl p-6 shadow-xs">
+          <div className="flex items-center justify-between mb-1">
+            <h2 className="font-display text-lg font-bold text-ink">Comportement clients</h2>
+            <Link to="/admin/ai" className="text-xs font-semibold text-brand-600 hover:underline">Analyse IA →</Link>
+          </div>
+          <p className="text-xs text-slate-400 mb-4">Événements de la période (clickstream)</p>
+          <div className="grid grid-cols-2 gap-3">
+            {[
+              { label: "Vues produit", value: behavior.views || 0, icon: "👁️" },
+              { label: "Ajouts panier", value: behavior.cart_adds || 0, icon: "🛒" },
+              { label: "Recherches", value: behavior.searches || 0, icon: "🔎" },
+              { label: "Messages chatbot", value: behavior.chats || 0, icon: "💬" },
+            ].map((k) => (
+              <div key={k.label} className="bg-slate-50 border border-slate-200/70 rounded-xl p-3">
+                <p className="text-[11px] text-slate-500">{k.icon} {k.label}</p>
+                <p className="font-display text-xl font-bold text-ink">{k.value}</p>
+              </div>
+            ))}
+          </div>
+          <div className="mt-4 flex items-center justify-between text-xs">
+            <span className="text-slate-500">Taux de conversion (commandes / vues)</span>
+            <span className="font-bold text-brand-700">{behavior.conversion_rate != null ? `${behavior.conversion_rate}%` : "—"}</span>
+          </div>
+          <div className="mt-2 flex items-center justify-between text-xs">
+            <span className="text-slate-500">Nouveaux clients • favoris enregistrés</span>
+            <span className="font-bold text-ink">{stats?.new_customers || 0} • {stats?.wishlist_items || 0}</span>
+          </div>
+        </div>
+
+        <div className="bg-white border border-slate-200/80 rounded-2xl p-6 shadow-xs">
+          <h2 className="font-display text-lg font-bold text-ink mb-1">CA par catégorie</h2>
+          <p className="text-xs text-slate-400 mb-4">Chiffre d'affaires de la période (hors annulées)</p>
+          {(stats?.category_revenue || []).some((c) => c.revenue > 0) ? (
+            <SimpleBarChart data={stats.category_revenue} xKey="name" bars={[{ key: "revenue", label: "CA (DT)" }]} height={200} formatter={(v) => [`${Number(v).toFixed(2)} DT`, "CA"]} />
+          ) : (
+            <p className="text-xs text-slate-400 py-4 text-center">Aucune vente sur la période.</p>
+          )}
         </div>
       </div>
 
