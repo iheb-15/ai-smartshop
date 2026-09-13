@@ -1,6 +1,14 @@
 import { useEffect, useState } from "react";
 import api from "../../api/client";
 
+const PAY_BADGE = {
+  PAID: "bg-emerald-50 text-emerald-700 border-emerald-200",
+  UNPAID: "bg-amber-50 text-amber-700 border-amber-200",
+  REFUNDED: "bg-slate-100 text-slate-600 border-slate-200",
+  FAILED: "bg-rose-50 text-rose-700 border-rose-200",
+};
+const PAY_LABEL = { PAID: "Payée", UNPAID: "Impayée", REFUNDED: "Remboursée", FAILED: "Échec" };
+
 const ALL_STATUSES = [
   { value: "PENDING", label: "En attente", color: "bg-amber-50 text-amber-700 border-amber-200" },
   { value: "CONFIRMED", label: "Confirmée", color: "bg-cyan-50 text-cyan-700 border-cyan-200" },
@@ -19,6 +27,8 @@ export default function AdminOrdersPage() {
   const [search, setSearch] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
+  const [paymentFilter, setPaymentFilter] = useState("all");
+  const [methodFilter, setMethodFilter] = useState("all");
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
 
@@ -46,6 +56,8 @@ export default function AdminOrdersPage() {
       };
       if (debouncedSearch.trim()) params.q = debouncedSearch.trim();
       if (statusFilter !== "all") params.status = statusFilter;
+      if (paymentFilter !== "all") params.payment_status = paymentFilter;
+      if (methodFilter !== "all") params.payment_method = methodFilter;
       if (dateFrom) params.date_from = new Date(dateFrom).toISOString();
       if (dateTo) params.date_to = new Date(dateTo + "T23:59:59").toISOString();
       const res = await api.get("/orders/all", { params });
@@ -72,12 +84,12 @@ export default function AdminOrdersPage() {
 
   useEffect(() => {
     setCurrentPage(1);
-  }, [debouncedSearch, statusFilter, dateFrom, dateTo]);
+  }, [debouncedSearch, statusFilter, paymentFilter, methodFilter, dateFrom, dateTo]);
 
   useEffect(() => {
     loadOrders();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [debouncedSearch, statusFilter, dateFrom, dateTo, currentPage]);
+  }, [debouncedSearch, statusFilter, paymentFilter, methodFilter, dateFrom, dateTo, currentPage]);
 
   const getStatusBadge = (status) => {
     const s = (status || "").toUpperCase();
@@ -91,7 +103,7 @@ export default function AdminOrdersPage() {
 
   const handleStatusChange = async (orderId, newStatus) => {
     try {
-      await api.put(`/orders/${orderId}/status?status=${encodeURIComponent(newStatus)}`);
+      await api.put(`/orders/${orderId}/status`, { status: newStatus });
       showToast(`Statut de la commande #${orderId} mis à jour : ${newStatus}`);
       loadOrders();
       if (selectedOrder && selectedOrder.id === orderId) {
@@ -101,6 +113,17 @@ export default function AdminOrdersPage() {
     } catch (err) {
       console.error(err);
       showToast(err?.response?.data?.detail || "Erreur lors de la mise à jour du statut.", "error");
+    }
+  };
+
+  const handlePaymentStatus = async (orderId, ps) => {
+    try {
+      const res = await api.put(`/orders/${orderId}/payment-status`, null, { params: { payment_status: ps } });
+      showToast(`Paiement de la commande #${orderId} : ${PAY_LABEL[ps] || ps}`);
+      loadOrders();
+      if (selectedOrder && selectedOrder.id === orderId) setSelectedOrder(res.data);
+    } catch (err) {
+      showToast(err?.response?.data?.detail || "Erreur lors de la mise à jour du paiement.", "error");
     }
   };
 
@@ -157,7 +180,7 @@ export default function AdminOrdersPage() {
         <div className="bg-white border border-slate-200/80 rounded-xl p-3 shadow-xs">
           <span className="text-[10px] font-bold text-cyan-600 uppercase">Confirmées</span>
           <p className="font-display text-lg font-bold text-ink mt-0.5">
-            {orders.filter((o) => ["CONFIRMED", "PAID"].includes((o.status || "").toUpperCase())).length}
+            {orders.filter((o) => (o.status || "").toUpperCase() === "CONFIRMED").length}
           </p>
         </div>
         <div className="bg-white border border-slate-200/80 rounded-xl p-3 shadow-xs">
@@ -182,7 +205,7 @@ export default function AdminOrdersPage() {
 
       {/* Filter and Search Bar */}
       <div className="bg-white border border-slate-200/80 rounded-2xl p-4 shadow-xs space-y-3">
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-3">
           {/* Search */}
           <div className="relative lg:col-span-2">
             <input
@@ -213,6 +236,22 @@ export default function AdminOrdersPage() {
                   {s.label} ({s.value})
                 </option>
               ))}
+            </select>
+          </div>
+
+          <div>
+            <select value={paymentFilter} onChange={(e) => setPaymentFilter(e.target.value)} className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-sm focus:bg-white focus:outline-hidden focus:border-brand-500 transition">
+              <option value="all">Tous paiements</option>
+              <option value="PAID">Payées</option>
+              <option value="UNPAID">Impayées (à encaisser)</option>
+              <option value="REFUNDED">Remboursées</option>
+            </select>
+          </div>
+          <div>
+            <select value={methodFilter} onChange={(e) => setMethodFilter(e.target.value)} className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-sm focus:bg-white focus:outline-hidden focus:border-brand-500 transition">
+              <option value="all">Tous modes</option>
+              <option value="card">Carte bancaire</option>
+              <option value="cash_on_delivery">À la livraison</option>
             </select>
           </div>
 
@@ -267,6 +306,7 @@ export default function AdminOrdersPage() {
                   <th className="py-3.5 px-5 font-semibold">Date</th>
                   <th className="py-3.5 px-5 font-semibold">Produits commandés</th>
                   <th className="py-3.5 px-5 font-semibold">Montant</th>
+                  <th className="py-3.5 px-5 font-semibold">Paiement</th>
                   <th className="py-3.5 px-5 font-semibold">Statut</th>
                   <th className="py-3.5 px-5 font-semibold text-right">Action</th>
                 </tr>
@@ -353,6 +393,14 @@ export default function AdminOrdersPage() {
                     {/* Total */}
                     <td className="py-4 px-5 font-bold text-ink text-sm">
                       {(o.total || 0).toFixed(2)} DT
+                    </td>
+
+                    {/* Paiement */}
+                    <td className="py-4 px-5">
+                      <span className={`inline-flex px-2 py-0.5 rounded-full text-[11px] font-semibold border ${PAY_BADGE[o.payment_status] || PAY_BADGE.UNPAID}`}>
+                        {o.payment_method === "card" ? "💳" : "🚚"} {PAY_LABEL[o.payment_status] || o.payment_status}
+                      </span>
+                      {o.shipping_city && <p className="text-[11px] text-slate-400 mt-1">📍 {o.shipping_city}</p>}
                     </td>
 
                     {/* Status Dropdown */}
@@ -484,6 +532,32 @@ export default function AdminOrdersPage() {
                 <p className="text-xs text-slate-400 mt-2">
                   Identifiant client : #{selectedOrder.user?.id || selectedOrder.user_id || "N/A"}
                 </p>
+                {selectedOrder.shipping_address && (
+                  <div className="mt-3 pt-3 border-t border-slate-200 text-xs text-slate-600">
+                    <p className="font-semibold text-slate-700">📦 Livraison</p>
+                    <p>{selectedOrder.shipping_name} • {selectedOrder.shipping_phone}</p>
+                    <p>{selectedOrder.shipping_address}, {selectedOrder.shipping_postal_code} {selectedOrder.shipping_city}</p>
+                    {selectedOrder.notes && <p className="italic text-slate-500 mt-1">« {selectedOrder.notes} »</p>}
+                  </div>
+                )}
+                <div className="mt-3 pt-3 border-t border-slate-200 text-xs">
+                  <p className="font-semibold text-slate-700 mb-1">💳 Paiement</p>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className={`px-2 py-0.5 rounded-full font-semibold border ${PAY_BADGE[selectedOrder.payment_status] || PAY_BADGE.UNPAID}`}>{PAY_LABEL[selectedOrder.payment_status] || selectedOrder.payment_status}</span>
+                    <span className="text-slate-500">{selectedOrder.payment_method === "card" ? "Carte bancaire" : "À la livraison"}</span>
+                    {selectedOrder.payment_status === "UNPAID" && selectedOrder.status !== "CANCELLED" && (
+                      <button onClick={() => handlePaymentStatus(selectedOrder.id, "PAID")} className="px-2 py-0.5 rounded-lg bg-emerald-600 text-white font-semibold hover:bg-emerald-700">Marquer payée</button>
+                    )}
+                    {selectedOrder.payment_status === "PAID" && (
+                      <button onClick={() => window.confirm("Rembourser cette commande (simulation) ?") && handlePaymentStatus(selectedOrder.id, "REFUNDED")} className="px-2 py-0.5 rounded-lg border border-slate-300 text-slate-600 font-semibold hover:bg-slate-100">Rembourser</button>
+                    )}
+                  </div>
+                  {(selectedOrder.payments || []).map((p) => (
+                    <p key={p.id} className="text-[11px] text-slate-500 mt-1 font-mono">
+                      {p.status} • {p.method === "card" ? `${p.card_brand || "Carte"} ••${p.card_last4 || "????"}` : "COD"} • {Math.abs(p.amount).toFixed(2)} DT • {p.transaction_ref}
+                    </p>
+                  ))}
+                </div>
               </div>
 
               {/* Status Update Card */}
@@ -603,12 +677,14 @@ export default function AdminOrdersPage() {
 
             {/* Close + print buttons */}
             <div className="mt-6 pt-4 border-t border-slate-100 flex justify-end gap-3">
-              <button
-                onClick={() => window.print()}
+              <a
+                href={`/orders/${selectedOrder.id}/invoice`}
+                target="_blank"
+                rel="noreferrer"
                 className="px-5 py-2.5 rounded-xl border border-slate-200 text-slate-700 text-xs font-semibold hover:bg-slate-50 transition"
               >
-                🖨 Imprimer la facture
-              </button>
+                🧾 Ouvrir la facture
+              </a>
               <button
                 onClick={() => setSelectedOrder(null)}
                 className="px-5 py-2.5 rounded-xl bg-slate-100 text-slate-700 text-xs font-semibold hover:bg-slate-200 transition"

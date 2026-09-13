@@ -5,6 +5,9 @@ from datetime import datetime
 
 from .. import models, schemas, auth
 from ..database import get_db
+from ..services.pricing import resolve_unit_price, active_promotions, best_price
+from ..services.payment import charge_card, refund as simulate_refund
+from ..services.tracking import log_event
 
 router = APIRouter(prefix="/orders", tags=["orders"])
 
@@ -18,93 +21,194 @@ VALID_STATUSES = [
     "CANCELLED",
 ]
 
+PAYMENT_STATUSES = ["UNPAID", "PAID", "FAILED", "REFUNDED"]
 
-def _active_promotions_for_product(db: Session, product: models.Product, now: datetime):
-    """Retourne les promotions actives applicables à un produit (produit / catégorie / globale)."""
-    query = db.query(models.Promotion).filter(models.Promotion.is_active == True)  # noqa: E712
-    all_promos = query.all()
-    applicable = []
-    for promo in all_promos:
-        if promo.starts_at and promo.starts_at > now:
+
+def _enrich_order_items(db: Session, order: models.Order) -> None:
+    """Injecte les caractéristiques produit dans chaque item (nom, image, catégorie)."""
+    for item in order.items or []:
+        p = item.product
+        if p is None:
+            p = db.query(models.Product).filter(models.Product.id == item.product_id).first()
+        if p is None:
             continue
-        if promo.ends_at and promo.ends_at < now:
-            continue
-        if promo.product_id is not None:
-            if promo.product_id == product.id:
-                applicable.append(promo)
-        elif promo.category_id is not None:
-            if product.category_id is not None and promo.category_id == product.category_id:
-                applicable.append(promo)
-        else:
-            # Promotion globale (ni produit ni catégorie) : s'applique à tout
-            applicable.append(promo)
-    return applicable
+        item.product_name = p.name
+        item.product_description = p.description or ""
+        item.product_image = p.image_url or ""
+        cat_name = None
+        if p.category is not None:
+            cat_name = p.category.name
+        elif p.category_id:
+            cat = db.query(models.Category).filter(models.Category.id == p.category_id).first()
+            cat_name = cat.name if cat else None
+        item.category_name = cat_name
 
 
-def resolve_unit_price(db: Session, product: models.Product, now: datetime | None = None) -> float:
-    """Meilleur prix client : min(promo_price manuelle, prix après meilleure promo active)."""
-    now = now or datetime.utcnow()
-    base_price = product.promo_price if product.promo_price is not None else product.price
-    try:
-        applicable = _active_promotions_for_product(db, product, now)
-    except Exception:
-        return base_price
-    best = base_price
-    for promo in applicable:
-        try:
-            discounted = round(product.price * (1 - float(promo.discount_percent) / 100.0), 2)
-        except Exception:
-            continue
-        if discounted < best:
-            best = discounted
-    return max(best, 0.0)
-
-
-@router.post("/checkout", response_model=schemas.OrderOut)
-def checkout(
-    db: Session = Depends(get_db), user: models.User = Depends(auth.get_current_user)
-):
-    cart_items = db.query(models.CartItem).filter(models.CartItem.user_id == user.id).all()
-    if not cart_items:
-        raise HTTPException(status_code=400, detail="Cart is empty")
-
-    # 1) Validation préalable : disponibilité + stock suffisant (pas de vente à découvert)
+def _validate_cart(cart_items: list[models.CartItem]) -> None:
     for ci in cart_items:
         product = ci.product
         if product is None:
             raise HTTPException(status_code=404, detail="Un produit du panier est introuvable.")
         if product.is_available is False:
-            raise HTTPException(
-                status_code=400,
-                detail=f"« {product.name} » n'est plus disponible à la vente.",
-            )
+            raise HTTPException(status_code=400, detail=f"« {product.name} » n'est plus disponible à la vente.")
         if product.stock < ci.quantity:
             raise HTTPException(
                 status_code=400,
                 detail=f"Stock insuffisant pour « {product.name} » : {product.stock} restant(s), {ci.quantity} demandé(s).",
             )
 
-    order = models.Order(user_id=user.id, status="CONFIRMED", total=0.0)
+
+@router.get("/checkout/preview")
+def checkout_preview(db: Session = Depends(get_db), user: models.User = Depends(auth.get_current_user)):
+    """Récapitulatif avant paiement : lignes avec prix effectifs, remises, total."""
+    cart_items = db.query(models.CartItem).filter(models.CartItem.user_id == user.id).all()
+    promos = active_promotions(db)
+    lines = []
+    subtotal = 0.0
+    total = 0.0
+    for ci in cart_items:
+        p = ci.product
+        if p is None:
+            continue
+        price, promo = best_price(p, promos)
+        lines.append(
+            {
+                "product_id": p.id,
+                "name": p.name,
+                "image_url": p.image_url,
+                "quantity": ci.quantity,
+                "unit_price": p.price,
+                "effective_price": price,
+                "promotion": promo.name if promo else ("Prix promo" if p.promo_price is not None and price < p.price else None),
+                "line_total": round(price * ci.quantity, 2),
+                "stock": p.stock,
+                "available": bool(p.is_available) and p.stock >= ci.quantity,
+            }
+        )
+        subtotal += p.price * ci.quantity
+        total += price * ci.quantity
+    return {
+        "lines": lines,
+        "subtotal": round(subtotal, 2),
+        "discount": round(subtotal - total, 2),
+        "shipping_fee": 0.0,
+        "total": round(total, 2),
+        "default_shipping": {
+            "full_name": user.full_name,
+            "phone": user.phone or "",
+            "address": user.address or "",
+            "city": user.city or "",
+            "postal_code": user.postal_code or "",
+        },
+    }
+
+
+@router.post("/checkout", response_model=schemas.OrderOut)
+def checkout(
+    payload: schemas.CheckoutRequest,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.get_current_user),
+):
+    """Passage de commande avec paiement simulé (carte) ou paiement à la livraison."""
+    cart_items = db.query(models.CartItem).filter(models.CartItem.user_id == user.id).all()
+    if not cart_items:
+        raise HTTPException(status_code=400, detail="Votre panier est vide.")
+
+    _validate_cart(cart_items)
+
+    if payload.payment_method == "card" and payload.card is None:
+        raise HTTPException(status_code=400, detail="Les informations de carte bancaire sont requises.")
+
+    now = datetime.utcnow()
+    promos = active_promotions(db, now)
+    total = 0.0
+    priced = []
+    for ci in cart_items:
+        unit_price, _ = best_price(ci.product, promos)
+        total += unit_price * ci.quantity
+        priced.append((ci, unit_price))
+    total = round(total, 2)
+
+    # 1) Paiement (simulation) AVANT de créer la commande : un refus ne crée aucune commande.
+    charge = None
+    if payload.payment_method == "card":
+        card = payload.card
+        charge = charge_card(total, card.number, card.holder, card.exp_month, card.exp_year, card.cvc)
+        if not charge.success:
+            # On journalise la tentative échouée (analyse des échecs de paiement côté admin), sans créer de commande
+            db.add(
+                models.Payment(
+                    order_id=None,
+                    user_id=user.id,
+                    method="card",
+                    amount=total,
+                    status="FAILED",
+                    transaction_ref=charge.transaction_ref,
+                    card_brand=charge.card_brand,
+                    card_last4=charge.card_last4,
+                    failure_reason=charge.failure_reason,
+                )
+            )
+            db.commit()
+            raise HTTPException(status_code=402, detail=charge.failure_reason or "Paiement refusé.")
+
+    # 2) Création de la commande
+    order = models.Order(
+        user_id=user.id,
+        status="CONFIRMED",
+        total=total,
+        payment_method=payload.payment_method,
+        payment_status="PAID" if charge else "UNPAID",
+        paid_at=now if charge else None,
+        shipping_name=payload.shipping.full_name,
+        shipping_phone=payload.shipping.phone,
+        shipping_address=payload.shipping.address,
+        shipping_city=payload.shipping.city,
+        shipping_postal_code=payload.shipping.postal_code,
+        notes=payload.notes,
+    )
     db.add(order)
     db.flush()
 
-    total = 0.0
-    now = datetime.utcnow()
-    for ci in cart_items:
-        unit_price = resolve_unit_price(db, ci.product, now)
-        total += unit_price * ci.quantity
-        order_item = models.OrderItem(
-            order_id=order.id,
-            product_id=ci.product_id,
-            quantity=ci.quantity,
-            unit_price=unit_price,
-        )
-        db.add(order_item)
-        # Décrémente strict (déjà validé ci-dessus)
+    for ci, unit_price in priced:
+        db.add(models.OrderItem(order_id=order.id, product_id=ci.product_id, quantity=ci.quantity, unit_price=unit_price))
         ci.product.stock -= ci.quantity
+        log_event(db, "purchase", user_id=user.id, product_id=ci.product_id, value=float(ci.quantity))
         db.delete(ci)
 
-    order.total = round(total, 2)
+    if charge:
+        db.add(
+            models.Payment(
+                order_id=order.id,
+                user_id=user.id,
+                method="card",
+                amount=total,
+                status="SUCCEEDED",
+                transaction_ref=charge.transaction_ref,
+                card_brand=charge.card_brand,
+                card_last4=charge.card_last4,
+            )
+        )
+    else:
+        db.add(
+            models.Payment(
+                order_id=order.id,
+                user_id=user.id,
+                method="cash_on_delivery",
+                amount=total,
+                status="PENDING",
+                transaction_ref=f"COD-{now.strftime('%Y%m%d')}-{order.id:05d}",
+            )
+        )
+
+    # 3) Mémorise l'adresse par défaut du client
+    if payload.save_address:
+        user.full_name = user.full_name or payload.shipping.full_name
+        user.phone = payload.shipping.phone
+        user.address = payload.shipping.address
+        user.city = payload.shipping.city
+        user.postal_code = payload.shipping.postal_code
+
     db.commit()
     db.refresh(order)
     _enrich_order_items(db, order)
@@ -115,7 +219,12 @@ def checkout(
 def my_orders(
     db: Session = Depends(get_db), user: models.User = Depends(auth.get_current_user)
 ):
-    orders = db.query(models.Order).filter(models.Order.user_id == user.id).order_by(models.Order.created_at.desc()).all()
+    orders = (
+        db.query(models.Order)
+        .filter(models.Order.user_id == user.id)
+        .order_by(models.Order.created_at.desc())
+        .all()
+    )
     for o in orders:
         _enrich_order_items(db, o)
     return orders
@@ -128,6 +237,8 @@ def all_orders(
     admin: models.User = Depends(auth.get_current_admin),
     q: Optional[str] = None,
     status: Optional[str] = None,
+    payment_status: Optional[str] = None,
+    payment_method: Optional[str] = None,
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
     skip: int = Query(0, ge=0),
@@ -136,6 +247,10 @@ def all_orders(
     query = db.query(models.Order)
     if status:
         query = query.filter(models.Order.status == status.strip().upper())
+    if payment_status:
+        query = query.filter(models.Order.payment_status == payment_status.strip().upper())
+    if payment_method:
+        query = query.filter(models.Order.payment_method == payment_method.strip().lower())
     if date_from:
         query = query.filter(models.Order.created_at >= date_from)
     if date_to:
@@ -159,42 +274,81 @@ def all_orders(
 def get_order(
     order_id: int,
     db: Session = Depends(get_db),
-    admin: models.User = Depends(auth.get_current_admin),
+    user: models.User = Depends(auth.get_current_user),
 ):
+    """Détail d'une commande : l'admin voit tout, le client uniquement les siennes (facture)."""
     order = db.query(models.Order).filter(models.Order.id == order_id).first()
-    if not order:
+    if not order or (not user.is_admin and order.user_id != user.id):
         raise HTTPException(status_code=404, detail="Commande non trouvée.")
     _enrich_order_items(db, order)
     return order
 
 
-def _enrich_order_items(db: Session, order: models.Order) -> None:
-    """Injecte les caractéristiques produit dans chaque item (nom, image, catégorie)."""
-    for item in order.items or []:
-        p = None
-        try:
-            p = item.product
-        except Exception:
-            p = None
-        if p is None:
-            p = db.query(models.Product).filter(models.Product.id == item.product_id).first()
-        if p is None:
-            continue
-        try:
-            item.product_name = p.name
-            item.product_description = p.description or ""
-            item.product_image = p.image_url or ""
-            cat_name = None
-            try:
-                cat_name = p.category.name if p.category else None
-            except Exception:
-                cat_name = None
-            if cat_name is None and getattr(p, "category_id", None):
-                cat = db.query(models.Category).filter(models.Category.id == p.category_id).first()
-                cat_name = cat.name if cat else None
-            item.category_name = cat_name
-        except Exception:
-            continue
+@router.post("/{order_id}/pay", response_model=schemas.OrderOut)
+def pay_order(
+    order_id: int,
+    payload: schemas.PayOrderRequest,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.get_current_user),
+):
+    """Paiement (simulé) d'une commande encore impayée (ex. commande à la livraison réglée en ligne)."""
+    order = db.query(models.Order).filter(models.Order.id == order_id, models.Order.user_id == user.id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Commande non trouvée.")
+    if order.status == "CANCELLED":
+        raise HTTPException(status_code=400, detail="Commande annulée : paiement impossible.")
+    if order.payment_status == "PAID":
+        raise HTTPException(status_code=400, detail="Cette commande est déjà payée.")
+    card = payload.card
+    charge = charge_card(order.total, card.number, card.holder, card.exp_month, card.exp_year, card.cvc)
+    db.add(
+        models.Payment(
+            order_id=order.id,
+            user_id=user.id,
+            method="card",
+            amount=order.total,
+            status="SUCCEEDED" if charge.success else "FAILED",
+            transaction_ref=charge.transaction_ref,
+            card_brand=charge.card_brand,
+            card_last4=charge.card_last4,
+            failure_reason=charge.failure_reason,
+        )
+    )
+    if not charge.success:
+        db.commit()
+        raise HTTPException(status_code=402, detail=charge.failure_reason or "Paiement refusé.")
+    for p in order.payments:
+        if p.status == "PENDING" and p.method == "cash_on_delivery":
+            p.status = "CANCELLED"
+            p.failure_reason = "Remplacé par un paiement en ligne."
+    order.payment_method = "card"
+    order.payment_status = "PAID"
+    order.paid_at = datetime.utcnow()
+    if order.status == "PENDING":
+        order.status = "CONFIRMED"
+    db.commit()
+    db.refresh(order)
+    _enrich_order_items(db, order)
+    return order
+
+
+def _restore_stock(db: Session, order: models.Order) -> None:
+    for item in order.items:
+        product = db.query(models.Product).filter(models.Product.id == item.product_id).first()
+        if product is not None:
+            product.stock = (product.stock or 0) + (item.quantity or 0)
+
+
+def _refund_if_paid(db: Session, order: models.Order) -> None:
+    if order.payment_status == "PAID":
+        ref = simulate_refund(order.total)
+        db.add(models.Payment(order_id=order.id, user_id=order.user_id, method=order.payment_method or "card", amount=-abs(order.total), status="REFUNDED", transaction_ref=ref))
+        order.payment_status = "REFUNDED"
+    elif order.payment_status == "UNPAID":
+        for p in order.payments:
+            if p.status == "PENDING":
+                p.status = "FAILED"
+                p.failure_reason = "Commande annulée avant encaissement."
 
 
 @router.post("/{order_id}/cancel", response_model=schemas.OrderOut)
@@ -203,7 +357,7 @@ def cancel_my_order(
     db: Session = Depends(get_db),
     user: models.User = Depends(auth.get_current_user),
 ):
-    """Annulation par le client lui-même (uniquement si encore PENDING/CONFIRMED)."""
+    """Annulation par le client lui-même (uniquement si encore PENDING/CONFIRMED). Rembourse si payé."""
     order = (
         db.query(models.Order)
         .filter(models.Order.id == order_id, models.Order.user_id == user.id)
@@ -217,10 +371,8 @@ def cancel_my_order(
             status_code=400,
             detail=f"Annulation impossible : commande déjà {current}. Contactez le support.",
         )
-    for item in order.items:
-        product = db.query(models.Product).filter(models.Product.id == item.product_id).first()
-        if product is not None:
-            product.stock = (product.stock or 0) + (item.quantity or 0)
+    _restore_stock(db, order)
+    _refund_if_paid(db, order)
     order.status = "CANCELLED"
     db.commit()
     db.refresh(order)
@@ -231,11 +383,13 @@ def cancel_my_order(
 @router.put("/{order_id}/status", response_model=schemas.OrderOut)
 def update_status(
     order_id: int,
-    status: str,
+    status: Optional[str] = None,
+    payload: Optional[schemas.OrderStatusUpdate] = None,
     db: Session = Depends(get_db),
     admin: models.User = Depends(auth.get_current_admin),
 ):
-    status_upper = status.strip().upper()
+    new_status = (payload.status if payload else status) or ""
+    status_upper = new_status.strip().upper()
     if status_upper not in VALID_STATUSES:
         raise HTTPException(
             status_code=400,
@@ -245,15 +399,54 @@ def update_status(
     if not order:
         raise HTTPException(status_code=404, detail="Commande non trouvée.")
     previous_status = (order.status or "PENDING").upper()
-    # Restaure le stock si la commande est annulée (et ne l'était pas déjà)
+    if previous_status == "CANCELLED" and status_upper != "CANCELLED":
+        raise HTTPException(status_code=400, detail="Une commande annulée ne peut pas être réactivée.")
+    # Restaure le stock + rembourse si la commande est annulée (et ne l'était pas déjà)
     if status_upper == "CANCELLED" and previous_status != "CANCELLED":
-        for item in order.items:
-            product = db.query(models.Product).filter(models.Product.id == item.product_id).first()
-            if product is not None:
-                product.stock = (product.stock or 0) + (item.quantity or 0)
+        _restore_stock(db, order)
+        _refund_if_paid(db, order)
+    # Paiement à la livraison : encaissé lors de la livraison
+    if status_upper == "DELIVERED" and order.payment_method == "cash_on_delivery" and order.payment_status == "UNPAID":
+        order.payment_status = "PAID"
+        order.paid_at = datetime.utcnow()
+        for p in order.payments:
+            if p.status == "PENDING":
+                p.status = "SUCCEEDED"
     order.status = status_upper
     db.commit()
     db.refresh(order)
     _enrich_order_items(db, order)
     return order
 
+
+@router.put("/{order_id}/payment-status", response_model=schemas.OrderOut)
+def update_payment_status(
+    order_id: int,
+    payment_status: str,
+    db: Session = Depends(get_db),
+    admin: models.User = Depends(auth.get_current_admin),
+):
+    """Admin : marquer manuellement une commande comme payée / remboursée (ex. encaissement à la livraison)."""
+    ps = payment_status.strip().upper()
+    if ps not in PAYMENT_STATUSES:
+        raise HTTPException(status_code=400, detail=f"Statut de paiement invalide : {', '.join(PAYMENT_STATUSES)}")
+    order = db.query(models.Order).filter(models.Order.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Commande non trouvée.")
+    if ps == "PAID" and order.payment_status != "PAID":
+        order.paid_at = datetime.utcnow()
+        db.add(models.Payment(order_id=order.id, user_id=order.user_id, method=order.payment_method or "cash_on_delivery", amount=order.total, status="SUCCEEDED", transaction_ref=f"MAN-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{order.id}"))
+        for p in order.payments:
+            if p.status == "PENDING":
+                p.status = "SUCCEEDED"
+    elif ps == "REFUNDED" and order.payment_status == "PAID":
+        db.add(models.Payment(order_id=order.id, user_id=order.user_id, method=order.payment_method or "card", amount=-abs(order.total), status="REFUNDED", transaction_ref=simulate_refund(order.total)))
+    order.payment_status = ps
+    db.commit()
+    db.refresh(order)
+    _enrich_order_items(db, order)
+    return order
+
+
+# Compat : anciens imports (products.py importait ces helpers depuis orders)
+__all__ = ["router", "VALID_STATUSES", "resolve_unit_price", "_enrich_order_items"]
