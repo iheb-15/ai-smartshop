@@ -45,7 +45,7 @@ def smart_search(
         commit=True,
     )
     return result
-
+##avis client
 
 @router.get("/recommendations/similar/{product_id}", response_model=List[schemas.ProductOut])
 def similar(product_id: int, db: Session = Depends(get_db), top_k: int = Query(6, ge=1, le=12)):
